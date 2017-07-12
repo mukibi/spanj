@@ -1,0 +1,1435 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use DBI;
+use Fcntl qw/:flock SEEK_END/;
+
+require "./conf.pl";
+
+our($db,$db_user,$db_pwd,$log_d,$doc_root,$upload_dir);
+
+my %session;
+my %auth_params;
+
+my $id;
+my $logd_in = 0;
+my $authd = 0;
+my $accountant = 0;
+
+my $con;
+my ($key,$iv,$cipher) = (undef, undef,undef);
+
+if ( exists $ENV{"HTTP_SESSION"} ) {
+
+	my @session_data = split/&/,$ENV{"HTTP_SESSION"};
+	my @tuple;
+
+	for my $unprocd_tuple (@session_data) {
+		#came to learn (as often happens, purely by accident)
+		#doing a split/=/,x= will give a list with a size of 1
+		#desirable here (where it's OK to ignore unset vars)
+		#would be awful where even a blank var means something (e.g
+		#logging in with a blank password)
+		@tuple = split/\=/,$unprocd_tuple;
+
+		if (@tuple == 2) {
+			$tuple[0] =~ s/%([A-Fa-f0-9]{2})/chr(hex($1))/ge;
+			$tuple[1] =~ s/%([A-Fa-f0-9]{2})/chr(hex($1))/ge;
+			$session{$tuple[0]} = $tuple[1];		
+		}
+	}
+
+	#logged in 
+	if (exists $session{"id"}) {
+		$logd_in++;
+		$id = $session{"id"};
+		#only bursar(user 2) and accountant(mod 17) can prepare fee statements
+		if ($id eq "2" or ($id =~ /^\d+$/ and ($id % 17) == 0) ) {
+
+			$accountant++;
+			if (exists $session{"sess_key"} ) {
+				$con = DBI->connect("DBI:mysql:database=$db;host=localhost", $db_user, $db_pwd, {'RaiseError'=>1, 'AutoCommit'=> 0});
+
+				use MIME::Base64 qw /decode_base64/;
+				use Crypt::Rijndael;
+
+				my $decoded = decode_base64($session{"sess_key"});
+				my @decoded_bytes = unpack("C*", $decoded);
+
+				my @sess_init_vec_bytes = splice(@decoded_bytes, 32);
+				my @sess_key_bytes = @decoded_bytes;
+
+				#read enc_keys_mem
+				my $prep_stmt3 = $con->prepare("SELECT init_vec,aes_key FROM enc_keys_mem WHERE u_id=? LIMIT 1");
+
+				if ( $prep_stmt3 ) {
+
+					my $rc = $prep_stmt3->execute($id);
+
+					if ( $rc ) {
+
+						my ($mem_init_vec, $mem_aes_key) = (undef,undef);
+
+						while (my @rslts = $prep_stmt3->fetchrow_array()) {
+							$mem_init_vec = $rslts[0];
+							$mem_aes_key = $rslts[1];
+						}
+
+						if ( defined $mem_init_vec ) {
+
+							my @mem_init_vec_bytes = unpack("C*", $mem_init_vec);
+							my @mem_aes_key_bytes = unpack("C*", $mem_aes_key);
+
+							my ( @decrypted_init_vec, @decrypted_aes_key );
+
+							for (my $i = 0; $i < @mem_init_vec_bytes; $i++) {
+								$decrypted_init_vec[$i] = $mem_init_vec_bytes[$i] ^ $sess_init_vec_bytes[$i];
+							}
+
+							for (my $j = 0; $j < @mem_aes_key_bytes; $j++) {
+								$decrypted_aes_key[$j] = $mem_aes_key_bytes[$j] ^ $sess_key_bytes[$j];
+							}
+
+							$key = pack("C*", @decrypted_aes_key);
+							$iv = pack("C*", @decrypted_init_vec);
+
+							$cipher = Crypt::Rijndael->new($key, Crypt::Rijndael::MODE_CBC());
+							$cipher->set_iv($iv);
+
+							$authd++;
+
+						}
+					}
+					else {
+						print STDERR "Couldn't execute SELECT FROM enc_keys_mem: ", $prep_stmt3->errstr, $/;
+					}
+
+				}
+				else {
+					print STDERR "Couldn't prepare SELECT FROM enc_keys_mem: ", $prep_stmt3->errstr, $/;
+				}
+			}
+		}
+	}
+}
+
+my $content = '';
+my $feedback = '';
+my $js = '';
+
+my $header =
+qq{
+<iframe width="30%" height=80 frameborder="1" src="/welcome2.html">
+		<h5>Welcome to the </br>Spanj Accounts Management Information System</h5>
+	</iframe>
+	<iframe width="20%" height=80 frameborder="1" src="/cgi-bin/check_login.cgi?cont=/">
+	</iframe>
+	<p><a href="/">Home</a> --&gt; <a href="/accounts/">Accounts</a> --&gt; <a href="/cgi-bin/fee_statements.cgi">Prepare Fee Statements</a>
+	<hr> 
+};
+
+unless ($authd) {
+	if ($logd_in) {
+		my $err = qq!<p><span style="color: red">Sorry, you do not have the appropriate privileges to prepare fee statements.</span> Only the bursar and accountant(s) are authorized to take this action.!;
+
+		#key issues?
+		if ( $accountant ) {
+
+			$err = qq!<p><span style="color: red">Sorry, could not obtain the encryption keys needed to manage accounts.</span> Try <a href="/cgi-bin/logout.cgi">logging out</a> and then log in again. If this problem persists, contact support.!;
+
+		}
+
+		$content .=
+qq*
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<title>Spanj::Accounts Management Information System::Prepare Fee Statements</title>
+</head>
+<body>
+$header
+
+</body>
+</html> 
+*;
+		print "Status: 200 OK\r\n";
+		print "Content-Type: text/html; charset=UTF-8\r\n";
+
+		my $len = length($content);
+		print "Content-Length: $len\r\n";
+
+		my @new_sess_array = ();
+
+		for my $sess_key (keys %session) {
+			push @new_sess_array, $sess_key."=".$session{$sess_key};        
+		}
+		my $new_sess = join ('&',@new_sess_array);
+
+		print "X-Update-Session: $new_sess\r\n";
+
+		print "\r\n";
+		print $content;
+		exit 0;
+	}
+	else {
+		print "Status: 302 Moved Temporarily\r\n";
+		print "Location: /login.html?cont=/cgi-bin/fee_statements.cgi\r\n";
+		print "Content-Type: text/html; charset=UTF-8\r\n";
+       		my $res = 
+qq!
+<html lang="en">
+<head>
+<title>Spanj::Accounts Management Information System</title>
+</head>
+<body>
+$header
+You should have been redirected to <a href="/login.html?cont=/cgi-bin/fee_statements.cgi">/login.html?cont=/cgi-bin/fee_statements.cgi</a>. If you were not, <a href="login.html?cont=/cgi-bin/fee_statements.cgi">Click Here</a> 
+</body>
+</html>!;
+
+		my $content_len = length($res);	
+		print "Content-Length: $content_len\r\n";
+		print "\r\n";
+		print $res;
+		exit 0;
+	}
+}
+
+my $post_mode = 0;
+my $boundary = undef;
+my $multi_part = 0;
+
+if (exists $ENV{"REQUEST_METHOD"} and uc($ENV{"REQUEST_METHOD"}) eq "POST") {
+	
+
+	if (exists $ENV{"CONTENT_TYPE"}) {
+		if ($ENV{"CONTENT_TYPE"} =~ m!multipart/form-data;\sboundary=(.+)!i) {
+			$boundary = $1;
+			$multi_part++;
+		}
+	}
+
+	unless ($multi_part) {
+		my $str = "";
+
+		while (<STDIN>) {
+        	       	$str .= $_;
+	       	}
+
+		my $space = " ";
+		$str =~ s/\x2B/$space/ge;
+		my @auth_req = split/&/,$str;
+
+		for my $auth_req_line (@auth_req) {
+			my $eqs = index($auth_req_line, "=");	
+			if ($eqs > 0) {
+				my ($k, $v) = (substr($auth_req_line, 0, $eqs), substr($auth_req_line, $eqs + 1)); 
+				$k =~ s/%([A-Fa-f0-9]{2})/chr(hex($1))/ge;
+				$v =~ s/%([A-Fa-f0-9]{2})/chr(hex($1))/ge;
+				$auth_params{$k} = $v;
+			}
+		}
+	}
+	#processing data sent 
+	$post_mode++;
+}
+
+PM: {
+if ($post_mode) { 
+	
+	unless ( exists $auth_params{"confirm_code"} and exists $session{"confirm_code"} and $auth_params{"confirm_code"} eq $session{"confirm_code"} ) {
+		$feedback = qq!<span style="color: red">Invalid request.</span> Do not alter the hidden values in the HTML form.!;
+		$post_mode = 0;
+		last PM; 
+	}
+
+	my $adm_filtered = 0;
+	my %adms = ();	
+
+	if (exists $auth_params{"adm_nos"} and length($auth_params{"adm_nos"}) > 0) {
+		
+		my @possib_adms = split/\s+/,$auth_params{"adm_nos"};
+
+		for my $possib_adm (@possib_adms) {
+
+			if ($possib_adm =~ /^\d+$/) {
+				$adms{$possib_adm} = {};
+				$adm_filtered++;
+			}
+
+			#ranges
+			elsif ($possib_adm =~ /^(\d+)\-(\d+)$/) {
+				my $start = $1;
+				my $stop = $2;
+				
+				#be kind to users, swap start 
+				#and stop if reverse-ordered
+				if ( $start > $stop ) {	
+					my $tmp = $start;
+					$start = $stop;
+					$stop = $tmp;
+				}
+
+				for ( my $i = $start; $i <= $stop; $i++ ) {
+					$adms{$i} = {};
+					$adm_filtered++;	
+				}
+			}
+		}
+
+		#read 'adms' table to determine student rolls
+		my %rolls = ();
+		my $prep_stmt3 = $con->prepare("SELECT adm_no,table_name FROM adms WHERE adm_no=? LIMIT 1");
+
+		if ($prep_stmt3) {
+
+			for my $adm (keys %adms) {
+
+				my $rc = $prep_stmt3->execute($adm);
+
+				if ($rc) {
+					while ( my @rslts = $prep_stmt3->fetchrow_array() ) {
+						${$adms{$rslts[0]}}{"roll"} = $rslts[1];
+						$rolls{$rslts[1]} = "N/A";		
+					}
+				}
+				else {
+					print STDERR "Could not execute SELECT FROM adms statement: ", $prep_stmt3->errstr, $/;
+				}
+			}
+		}
+		else {
+			print STDERR "Could not prepare SELECT FROM adms statement: ", $prep_stmt3->errstr, $/;
+		}
+
+		for my $adm (keys %adms) {
+			delete $adms{$adm} if (not exists ${$adms{$adm}}{"roll"});
+		}
+
+		#read 'student_rolls' to derermine classes
+		if ( scalar (keys %rolls) > 0 ) {
+
+			my %roll_students_lookup = ();
+			my $yr = (localtime)[5] + 1900;
+
+			my @where_clause_bts = ();
+	
+			for my $roll (keys %rolls) {
+				push @where_clause_bts, "table_name=?";
+			}
+
+			my $where_clause = join(" OR ", @where_clause_bts);
+
+			my $prep_stmt4 = $con->prepare("SELECT table_name,class,start_year,grad_year FROM student_rolls WHERE $where_clause");
+
+			if ($prep_stmt4) {
+				my $rc = $prep_stmt4->execute(keys %rolls);
+				if ($rc) {
+					while ( my @rslts = $prep_stmt4->fetchrow_array() ) {	
+						my $class = "N/A";
+						#student ha already graduated
+						if ( $rslts[3] < $yr ) {
+
+							my $study_yr = ($rslts[3] - $rslts[2]) + 1;
+							$class = uc($rslts[1]);
+							$class =~ s/\d+/$study_yr/;
+
+							$class .= "($rslts[3])";	
+						}
+						else {
+							my $study_yr = ($yr - $rslts[2]) + 1;
+							$class = uc($rslts[1]);
+							$class =~ s/\d+/$study_yr/;	
+						}
+
+						$rolls{$rslts[0]} = $class;	
+					}
+				}
+				else {
+					print STDERR "Could not execute SELECT FROM student_rolls statement: ", $prep_stmt4->errstr, $/;
+				}
+			}
+			else {
+				print STDERR "Could not prepare SELECT FROM student_rolls statement: ", $prep_stmt4->errstr, $/;
+			}
+
+			for my $adm ( keys %adms ) {
+
+				my $roll = ${$adms{$adm}}{"roll"};
+				my $class = "N/A";
+
+				#accomodate missing classes
+				if ( exists $rolls{$roll} ) {
+					$class = $rolls{$roll};
+				}
+
+				${$adms{$adm}}{"class"} = $class;
+				${$roll_students_lookup{$roll}}{$adm}++;
+			}
+
+			for my $roll ( keys %rolls ) {
+
+				my @roll_students =  keys %{$roll_students_lookup{$roll}};
+				my $num_roll_students = scalar(@roll_students);
+
+				my @where_clause_bts = ();
+	
+				foreach ( @roll_students ) {
+					push @where_clause_bts, "adm=?";
+				}
+
+				my $where_clause = join(" OR ", @where_clause_bts);
+
+				my $prep_stmt5 = $con->prepare("SELECT adm,s_name,o_names,house_dorm FROM `$roll` WHERE $where_clause LIMIT $num_roll_students");
+
+				if ( $prep_stmt5 ) {
+
+					my $rc = $prep_stmt5->execute(@roll_students);
+
+					if ($rc) {
+						while ( my @rslts = $prep_stmt5->fetchrow_array() ) {
+							${$adms{$rslts[0]}}{"name"} = $rslts[1] . " " .$rslts[2];
+							${$adms{$rslts[0]}}{"dorm"} = (not defined $rslts[3] or $rslts[3] eq "") ? "N/A" : $rslts[3];
+						}
+					}
+					else {
+						print STDERR "Could not execute SELECT FROM $roll statement: ", $prep_stmt5->errstr, $/;
+					}
+				}
+				else {
+					print STDERR "Could not prepare SELECT FROM $roll statement: ", $prep_stmt5->errstr, $/;
+				}
+
+			}
+		}
+	}
+
+	my $class_filtered = 0;
+	my %classes;
+	my %student_rolls = ();
+	
+	#don't do adm AND class lim
+	if (not $adm_filtered) {
+
+		my $yr = (localtime)[5] + 1900;
+		if ( exists $auth_params{"year"} and $auth_params{"year"} =~ /^\d{4}$/ ) {
+			#can't go forward in time
+			if ($auth_params{"year"} <= $yr) {
+				$yr = $auth_params{"year"};	
+			}
+		}
+
+		for my $auth_param (keys %auth_params) {
+			if ($auth_param =~ /^class_/) {
+				$classes{uc($auth_params{$auth_param})}++;	
+			}
+		}
+
+		#read student rolls
+		if ( scalar(keys %classes) > 0 ) {
+			$class_filtered++;
+
+			my $current_yr = (localtime)[5] + 1900;
+
+			my $prep_stmt1 = $con->prepare("SELECT table_name,class,start_year,grad_year FROM student_rolls");
+	
+			if ($prep_stmt1) {
+				my $rc = $prep_stmt1->execute();
+				if ($rc) {
+					while ( my @rslts = $prep_stmt1->fetchrow_array() ) {
+
+						my $class = "N/A";
+						#student ha already graduated
+						if ( $rslts[3] < $current_yr ) {
+
+							my $study_yr = ($yr - $rslts[2]) + 1;
+							$class = uc($rslts[1]);
+							$class =~ s/\d+/$study_yr/;
+
+							if (exists $classes{$class}) {
+								$student_rolls{$rslts[0]} = $class . "($rslts[3])" ;
+							}
+						}
+						else {
+							my $study_yr = ($yr - $rslts[2]) + 1;
+							$class = uc($rslts[1]);
+							$class =~ s/\d+/$study_yr/;	
+							if (exists $classes{$class}) {
+								$student_rolls{$rslts[0]} = $class;
+							}
+						}
+					}
+				}
+				else {
+					print STDERR "Could not execute SELECT FROM student_rolls statement: ", $prep_stmt1->errstr, $/;
+				}
+			}
+			else {
+				print STDERR "Could not prepare SELECT FROM student_rolls statement: ", $prep_stmt1->errstr, $/;
+			}
+		}
+
+		if ( scalar (keys %student_rolls) ) {
+			for my $roll ( keys %student_rolls ) {
+
+				my $class = $student_rolls{$roll};
+
+				my $prep_stmt2 = $con->prepare("SELECT adm,s_name,o_names,house_dorm FROM `$roll`");
+
+				if ($prep_stmt2) {
+					my $rc = $prep_stmt2->execute();
+					if ($rc) {
+						while ( my @rslts = $prep_stmt2->fetchrow_array() ) {
+							$adms{$rslts[0]} = {"class" => $class,"name" => $rslts[1] . " " .$rslts[2], "dorm" => ((not defined $rslts[3] or $rslts[3] eq "") ? "N/A" : $rslts[3])};
+						}
+					}
+					else {
+						print STDERR "Could not execute SELECT FROM $roll statement: ", $prep_stmt2->errstr, $/;
+					}
+				}
+				else {
+					print STDERR "Could not prepare SELECT FROM $roll statement: ", $prep_stmt2->errstr, $/;
+				}
+			}
+		}
+	}
+
+	#no student matched
+	unless ( scalar(keys %adms) > 0 ) {
+		#an invalid selection was made
+		if ($adm_filtered or $class_filtered) {
+			$feedback = qq!<span style="color: red">Your student filter did not match any students in the database.</span>!;
+		}
+		else {
+			$feedback = qq!<span style="color: red">You did not specify any student filter(admission number or class).</span>!;
+		}
+		$post_mode = 0;
+		last PM;
+	}
+
+
+	use Digest::HMAC_SHA1 qw/hmac_sha1_hex/;
+
+	my %voteheads = ("arrears" => "Arrears");
+	my %fee_voteheads = ("arrears" => "Arrears");
+
+	#read budget
+	my $prep_stmt9 = $con->prepare("SELECT votehead,votehead_parent,amount,hmac FROM budget");
+	
+	if ($prep_stmt9) {
+	
+		my $rc = $prep_stmt9->execute();
+		if ($rc) {
+			while ( my @rslts = $prep_stmt9->fetchrow_array() ) {
+						
+				my $decrypted_votehead = $cipher->decrypt($rslts[0]);
+				my $decrypted_votehead_parent = $cipher->decrypt($rslts[1]);	
+				my $decrypted_amount = $cipher->decrypt($rslts[2]);
+
+				my $votehead_n = remove_padding($decrypted_votehead);
+				my $votehead_parent = remove_padding($decrypted_votehead_parent);	
+				my $amount = remove_padding($decrypted_amount);
+	
+				#valid decryption
+				if ( $amount =~ /^\-?\d{1,10}(\.\d{1,2})?$/ ) {
+
+					my $hmac = uc(hmac_sha1_hex($votehead_n . $votehead_parent . $amount, $key));
+								
+					#auth the data
+					if ( $hmac eq $rslts[3] ) {
+						$voteheads{lc($votehead_n)} = $votehead_n;
+					}
+				}
+
+			}
+		}
+		else {
+			print STDERR "Couldn't execute SELECT FROM budget: ", $prep_stmt9->errstr, $/;
+		}
+	}
+	else {
+		print STDERR "Couldn't prepare SELECT FROM budget: ", $prep_stmt9->errstr, $/;
+	}
+
+	#INFORMATION_SCHEMA db handle
+	my $con2 = DBI->connect("DBI:mysql:database=INFORMATION_SCHEMA;host=localhost", $db_user, $db_pwd, {'RaiseError'=>1, 'AutoCommit'=> 0});
+
+	my %fee_structure_tables = ();
+
+	#which fee structures have ever been published
+	my $prep_stmt11 = $con2->prepare("SELECT TABLE_NAME FROM TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME LIKE ?");
+
+	if ($prep_stmt11) {
+		my $rc = $prep_stmt11->execute($db, 'fee_structure%');
+		if ($rc) {
+			while ( my @rslts = $prep_stmt11->fetchrow_array() ) {
+				$fee_structure_tables{$rslts[0]} = 0;
+			}
+		}
+		else {
+			print STDERR "Couldn't execute SELECT FROM INFORMATION_SCHEMA.TABLES: ", $prep_stmt11->errstr, $/;
+		}
+	}
+	else {
+		print STDERR "Couldn't execute SELECT FROM INFORMATION_SCHEMA.TABLES: ", $prep_stmt11->errstr, $/;
+	}
+
+	#verify tables
+	my $prep_stmt12 = $con2->prepare("SELECT COLUMN_NAME FROM COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=?");
+
+	if ($prep_stmt12) {
+
+		for my $table (keys %fee_structure_tables) {
+
+			#which fee structures have ever been published
+			my $rc = $prep_stmt12->execute($db,$table);
+			if ($rc) {
+
+				my %cols = ();
+				while ( my @rslts = $prep_stmt12->fetchrow_array() ) {
+					$cols{lc($rslts[0])}++;
+				}
+
+				if ( scalar(keys %cols) == 5 and exists $cols{"votehead_index"} and exists $cols{"votehead_name"} and exists $cols{"class"} and exists $cols{"amount"} and exists $cols{"hmac"} ) {
+					$fee_structure_tables{$table}++;
+				}
+			}
+			else {
+				print STDERR "Couldn't execute SELECT FROM INFORMATION_SCHEMA.COLUMNS: ", $prep_stmt12->errstr, $/;
+			}
+		}
+
+	}
+	else {
+		print STDERR "Couldn't execute SELECT FROM INFORMATION_SCHEMA.COLUMNS: ", $prep_stmt12->errstr, $/;
+	}
+
+	#delete any tables that do not
+	#appear valid
+	for my $table (keys %fee_structure_tables) {
+		delete $fee_structure_tables{$table} unless ($fee_structure_tables{$table} > 0);
+	}
+
+
+	#read fee structure -- for relevant voteheads
+	for my $table_1 (keys %fee_structure_tables) {
+
+		my $prep_stmt6 = $con->prepare("SELECT votehead_index,votehead_name,class,amount,hmac FROM $table_1");
+	
+		if ($prep_stmt6) {
+	
+			my $rc = $prep_stmt6->execute();
+			if ($rc) {
+
+				while ( my @rslts = $prep_stmt6->fetchrow_array() ) {
+						
+					my $decrypted_votehead_index = $cipher->decrypt($rslts[0]);
+					my $decrypted_votehead_name = $cipher->decrypt($rslts[1]);
+					my $decrypted_class = $cipher->decrypt($rslts[2]);
+					my $decrypted_amount = $cipher->decrypt($rslts[3]);
+
+					my $votehead_index = remove_padding($decrypted_votehead_index);
+					my $votehead_name = remove_padding($decrypted_votehead_name);
+					my $class = remove_padding($decrypted_class);
+					my $amount = remove_padding($decrypted_amount);
+	
+					#valid decryption
+					if ( $amount =~ /^\-?\d{1,10}(\.\d{1,2})?$/ ) {
+
+						my $hmac = uc(hmac_sha1_hex($votehead_index . $votehead_name . $class . $amount, $key));
+									
+						#auth the data
+						if ( $hmac eq $rslts[4] ) {	
+							$fee_voteheads{lc($votehead_name)} = $votehead_name;
+						}
+					}
+				}
+			}
+			else {
+				print STDERR "Couldn't execute SELECT FROM $table_1: ", $prep_stmt6->errstr, $/;
+			}
+		}
+		else {
+			print STDERR "Couldn't prepare SELECT FROM $table_1: ", $prep_stmt6->errstr, $/;
+		}
+	}
+	
+	my %stud_balances = ();
+	for my $adm (keys %adms) {
+		$stud_balances{$adm} = 0;
+	}
+
+	#fee where
+	my @where_clause_bts_0 = ();
+
+	foreach ( keys %fee_voteheads ) {
+		push @where_clause_bts_0, "BINARY account_name=?";
+	}
+
+	my $where_clause_0 = join(" OR ", @where_clause_bts_0);
+	my $max_num_rows_0 = scalar(@where_clause_bts_0);
+
+	#all accounts where
+	my @where_clause_bts_1 = ();
+
+	foreach ( keys %voteheads ) {
+		push @where_clause_bts_1, "BINARY account_name=?";
+	}
+
+	my $where_clause_1 = join(" OR ", @where_clause_bts_1);
+	my $max_num_rows_1 = scalar(@where_clause_bts_1);
+
+	my %encd_accnt_names = ();
+
+	my $prep_stmt7 = $con->prepare("SELECT account_name,class,amount,hmac FROM account_balances WHERE $where_clause_0 LIMIT $max_num_rows_0");
+	
+	if ($prep_stmt7) {
+
+		for my $adm (keys %adms) {
+			$encd_accnt_names{$adm} = {};
+
+			for my $votehead (keys %fee_voteheads) {
+				${$encd_accnt_names{$adm}}{$cipher->encrypt(add_padding($adm . "-" . $votehead))} = $votehead;
+			}
+
+			my $rc = $prep_stmt7->execute(keys %{$encd_accnt_names{$adm}});
+
+			if ($rc) {
+
+				while (my @rslts = $prep_stmt7->fetchrow_array()) {
+
+					my $decrypted_account_name = $cipher->decrypt($rslts[0]);
+					my $decrypted_class = $cipher->decrypt($rslts[1]);
+					my $decrypted_amount = $cipher->decrypt($rslts[2]);
+
+					my $account_name = remove_padding($decrypted_account_name);
+					my $class = remove_padding($decrypted_class);
+					my $amount = remove_padding($decrypted_amount);
+
+					#valid decryption
+					if ( $amount =~ /^\-?\d{1,10}(\.\d{1,2})?$/ ) {
+
+						my $hmac = uc(hmac_sha1_hex($account_name . $class . $amount, $key));
+
+						#auth the data
+						if ( $hmac eq $rslts[3] ) {		
+							$stud_balances{$adm} += $amount;
+						}
+					}
+				}
+			}
+			else {
+				print STDERR "Couldn't execute SELECT FROM account_balances: ", $prep_stmt7->errstr, $/;
+			}
+		}
+	}
+	else {
+		print STDERR "Couldn't prepare SELECT FROM account_balances: ", $prep_stmt7->errstr, $/;
+	}
+
+	my %events = ();
+	my $cntr = 0;
+
+	my %receipt_tables = ();
+	my %deleted_receipt_tables = ();
+
+	#get all historical and current receipts
+	if ($prep_stmt11) {
+		my $rc = $prep_stmt11->execute($db, 'receipts%');
+		if ($rc) {
+			while ( my @rslts = $prep_stmt11->fetchrow_array() ) {
+				$receipt_tables{$rslts[0]} = 0;
+			}
+		}
+		else {
+			print STDERR "Couldn't execute SELECT FROM INFORMATION_SCHEMA.TABLES: ", $prep_stmt11->errstr, $/;
+		}
+	}
+	else {
+		print STDERR "Couldn't execute SELECT FROM INFORMATION_SCHEMA.TABLES: ", $prep_stmt11->errstr, $/;
+	}
+
+	#get all historical and current receipts
+	if ($prep_stmt11) {
+		my $rc = $prep_stmt11->execute($db, 'deleted_receipts%');
+		if ($rc) {
+			while ( my @rslts = $prep_stmt11->fetchrow_array() ) {
+				$deleted_receipt_tables{$rslts[0]} = 0;
+			}
+		}
+		else {
+			print STDERR "Couldn't execute SELECT FROM INFORMATION_SCHEMA.TABLES: ", $prep_stmt11->errstr, $/;
+		}
+	}
+	else {
+		print STDERR "Couldn't execute SELECT FROM INFORMATION_SCHEMA.TABLES: ", $prep_stmt11->errstr, $/;
+	}
+
+	if ($prep_stmt12) {
+
+		for my $table (keys %receipt_tables) {
+
+			#which fee structures have ever been published
+			my $rc = $prep_stmt12->execute($db,$table);
+			if ($rc) {
+
+				my %cols = ();
+				while ( my @rslts = $prep_stmt12->fetchrow_array() ) {
+					$cols{lc($rslts[0])}++;
+				}
+
+				if ( scalar(keys %cols) == 9 and exists $cols{"receipt_no"} and exists $cols{"paid_in_by"} and exists $cols{"class"} and exists $cols{"amount"} and exists $cols{"mode_payment"}  and exists $cols{"ref_id"} and exists $cols{"votehead"} and exists $cols{"time"} and exists $cols{"hmac"} ) {
+					$receipt_tables{$table}++;
+				}
+			}
+			else {
+				print STDERR "Couldn't execute SELECT FROM INFORMATION_SCHEMA.COLUMNS: ", $prep_stmt12->errstr, $/;
+			}
+		}
+	}
+	else {
+		print STDERR "Couldn't execute SELECT FROM INFORMATION_SCHEMA.COLUMNS: ", $prep_stmt12->errstr, $/;
+	}
+
+	if ($prep_stmt12) {
+
+		for my $table (keys %deleted_receipt_tables) {
+
+			#which fee structures have ever been published
+			my $rc = $prep_stmt12->execute($db,$table);
+			if ($rc) {
+
+				my %cols = ();
+				while ( my @rslts = $prep_stmt12->fetchrow_array() ) {
+					$cols{lc($rslts[0])}++;
+				}
+
+				if ( scalar(keys %cols) == 9 and exists $cols{"receipt_no"} and exists $cols{"paid_in_by"} and exists $cols{"class"} and exists $cols{"amount"} and exists $cols{"mode_payment"}  and exists $cols{"ref_id"} and exists $cols{"votehead"} and exists $cols{"time"} and exists $cols{"hmac"} ) {
+					$deleted_receipt_tables{$table}++;
+				}
+			}
+			else {
+				print STDERR "Couldn't execute SELECT FROM INFORMATION_SCHEMA.COLUMNS: ", $prep_stmt12->errstr, $/;
+			}
+		}
+	}
+	else {
+		print STDERR "Couldn't execute SELECT FROM INFORMATION_SCHEMA.COLUMNS: ", $prep_stmt12->errstr, $/;
+	}
+
+	for my $table_2 (keys %receipt_tables) {
+		delete $receipt_tables{$table_2} unless ($receipt_tables{$table_2} > 0);
+	}
+
+	for my $table_2 (keys %deleted_receipt_tables) {
+		delete $deleted_receipt_tables{$table_2} unless ($deleted_receipt_tables{$table_2} > 0);
+	}
+
+	for my $table_3 (keys %receipt_tables) {
+		#read receipts
+		my $prep_stmt8 = $con->prepare("SELECT receipt_no,paid_in_by,class,amount,mode_payment,ref_id,votehead,time,hmac FROM $table_3 WHERE paid_in_by=?");
+
+		if ($prep_stmt8) {
+
+			for my $stud (keys %adms) {
+
+				my $encd_adm = $cipher->encrypt(add_padding($stud));
+
+				my $rc = $prep_stmt8->execute($encd_adm);
+
+				if ($rc) {
+
+					while ( my @rslts = $prep_stmt8->fetchrow_array() ) {
+
+						my $receipt_no = $rslts[0];
+						my $paid_in_by = remove_padding($cipher->decrypt($rslts[1]));
+						my $class = remove_padding($cipher->decrypt($rslts[2]));
+						my $amount = remove_padding($cipher->decrypt($rslts[3]));
+						my $mode_payment = remove_padding($cipher->decrypt($rslts[4]));
+						my $ref_id = remove_padding($cipher->decrypt($rslts[5]));
+ 						my $votehead = remove_padding($cipher->decrypt($rslts[6]));
+						my $time = remove_padding($cipher->decrypt($rslts[7]));
+
+						if ( $amount =~ /^\d{1,10}(\.\d{1,2})?$/ ) {
+
+							my $hmac = uc(hmac_sha1_hex($paid_in_by . $class . $amount . $mode_payment . $ref_id . $votehead . $time, $key));
+
+							if ( $hmac eq $rslts[8] ) {
+								${$events{$stud}}{$cntr++} = {"receipt_no" => $receipt_no, "amount" => $amount, "time" => $time, "votehead" => $votehead};	
+							}
+						}	
+					}
+				}
+				else {
+					print STDERR "Couldn't execute SELECT FROM $table_3: ", $prep_stmt8->errstr, $/;
+				}
+			}
+		}
+		else {
+			print STDERR "Couldn't execute SELECT FROM $table_3: ", $prep_stmt8->errstr, $/;
+		}
+	}
+
+	for my $table_3 (keys %deleted_receipt_tables) {
+		#read receipts
+		my $prep_stmt8 = $con->prepare("SELECT receipt_no,paid_in_by,class,amount,mode_payment,ref_id,votehead,time,hmac FROM $table_3 WHERE paid_in_by=?");
+
+		if ($prep_stmt8) {
+
+			for my $stud (keys %adms) {
+
+				my $encd_adm = $cipher->encrypt(add_padding($stud));
+
+				my $rc = $prep_stmt8->execute($encd_adm);
+
+				if ($rc) {
+
+					while ( my @rslts = $prep_stmt8->fetchrow_array() ) {
+
+						my $receipt_no = $rslts[0];
+						my $paid_in_by = remove_padding($cipher->decrypt($rslts[1]));
+						my $class = remove_padding($cipher->decrypt($rslts[2]));
+						my $amount = remove_padding($cipher->decrypt($rslts[3]));
+						my $mode_payment = remove_padding($cipher->decrypt($rslts[4]));
+						my $ref_id = remove_padding($cipher->decrypt($rslts[5]));
+ 						my $votehead = remove_padding($cipher->decrypt($rslts[6]));
+						my $time = remove_padding($cipher->decrypt($rslts[7]));
+
+						if ( $amount =~ /^\d{1,10}(\.\d{1,2})?$/ ) {
+
+							my $hmac = uc(hmac_sha1_hex($paid_in_by . $class . $amount . $mode_payment . $ref_id . $votehead . $time, $key));
+
+							if ( $hmac eq $rslts[8] ) {
+								${$events{$stud}}{$cntr++} = {"receipt_no" => $receipt_no, "amount" => $amount, "deleted" => 1, "time" => $time, "votehead" => $votehead};	
+							}
+						}	
+					}
+				}
+				else {
+					print STDERR "Couldn't execute SELECT FROM $table_3: ", $prep_stmt8->errstr, $/;
+				}
+			}
+		}
+		else {
+			print STDERR "Couldn't execute SELECT FROM $table_3: ", $prep_stmt8->errstr, $/;
+		}
+	}
+
+	my %account_updates_tables = ();
+
+	#get all historical and current account_balance_updates
+	if ($prep_stmt11) {
+		my $rc = $prep_stmt11->execute($db, 'account_balance_updates%');
+		if ($rc) {
+			while ( my @rslts = $prep_stmt11->fetchrow_array() ) {	
+				$account_updates_tables{$rslts[0]} = 0;
+			}
+		}
+		else {
+			print STDERR "Couldn't execute SELECT FROM INFORMATION_SCHEMA.TABLES: ", $prep_stmt11->errstr, $/;
+		}
+	}
+	else {
+		print STDERR "Couldn't execute SELECT FROM INFORMATION_SCHEMA.TABLES: ", $prep_stmt11->errstr, $/;
+	}
+
+	if ($prep_stmt12) {
+
+		for my $table (keys %account_updates_tables) {
+
+			#which fee structures have ever been published
+			my $rc = $prep_stmt12->execute($db,$table);
+			if ($rc) {
+
+				my %cols = ();
+				while ( my @rslts = $prep_stmt12->fetchrow_array() ) {
+					$cols{lc($rslts[0])}++;
+				}
+
+				if ( scalar(keys %cols) == 4 and exists $cols{"account_name"} and exists $cols{"amount"} and exists $cols{"time"} and exists $cols{"hmac"} ) {
+					$account_updates_tables{$table}++;
+				}
+			}
+			else {
+				print STDERR "Couldn't execute SELECT FROM INFORMATION_SCHEMA.COLUMNS: ", $prep_stmt12->errstr, $/;
+			}
+		}
+	}
+	else {
+		print STDERR "Couldn't execute SELECT FROM INFORMATION_SCHEMA.COLUMNS: ", $prep_stmt12->errstr, $/;
+	}
+
+	for my $table_4 (keys %account_updates_tables) {
+
+		my $prep_stmt10 = $con->prepare("SELECT account_name,amount,time,hmac FROM $table_4 WHERE $where_clause_0");
+
+		if ($prep_stmt10) {
+
+			for my $adm (keys %adms) {
+
+				my $rc = $prep_stmt10->execute(keys %{$encd_accnt_names{$adm}});
+				if ($rc) {
+					while ( my @rslts = $prep_stmt10->fetchrow_array() ) {
+
+						my $account_name = remove_padding($cipher->decrypt($rslts[0]));
+						my $amount = remove_padding($cipher->decrypt($rslts[1]));
+						my $time = remove_padding($cipher->decrypt($rslts[2]));
+
+						if ( $amount =~ /^\-?\d{1,10}(\.\d{1,2})?$/ ) {
+
+							my $hmac = uc(hmac_sha1_hex($account_name . $amount . $time, $key));
+
+							if ( $hmac eq $rslts[3] ) {
+								#amount should be -inverted to make walking
+								#back possible	
+								${$events{$adm}}{$cntr++} = {"amount" => ($amount * -1), "time" => $time, "votehead" => "fees"};
+							}	
+						}	
+					}
+				}
+				else {
+					print STDERR "Couldn't execute SELECT FROM $table_4: ", $prep_stmt10->errstr, $/;
+				}
+			}
+		}
+		else {
+			print STDERR "Couldn't execute SELECT FROM account_balance_updates: ", $prep_stmt10->errstr, $/;
+		}
+	}
+
+	for my $stud (keys %events) {
+
+		#my %events = %{$events{$stud}};
+		#sort newest 1st
+		for my $cntr ( sort { $events{$stud}->{$b}->{"time"} <=> $events{$stud}->{$a}->{"time"} } keys %{$events{$stud}} ) {
+
+			
+
+			if ( $events{$stud}->{$cntr}->{"votehead"} eq "fees" ) {
+
+				$events{$stud}->{$cntr}->{"balance"} = $stud_balances{$stud};
+				$stud_balances{$stud} += $events{$stud}->{$cntr}->{"amount"};
+			}	
+		}
+	}
+
+	my $template = $auth_params{"message_format"};
+
+	my $results = "";
+
+	for my $adm (sort { $a <=> $b } keys %adms) {
+
+		my $stud_data = htmlspecialchars($template);	
+	
+		#newlines
+		$stud_data =~ s/\r?\n/<br>/g;
+
+		#allow bold, italics, underline, <<letter_head>>, <<
+		$stud_data =~ s/&#60;b&#62;/<span style="font-weight: bold">/ig;
+		$stud_data =~ s/&#60;\/b&#62;/<\/span>/ig;
+			
+		$stud_data =~ s/&#60;u&#62;/<span style="text-decoration: underline">/ig;
+		$stud_data =~ s/&#60;\/u&#62;/<\/span>/ig;
+
+		$stud_data =~ s/&#60;i&#62;/<span style="font-style: italic">/ig;
+		$stud_data =~ s/&#60;\/i&#62;/<\/span>/ig;
+
+		#letterhead
+		if ( $stud_data =~ /&#60;&#60;letter_head&#62;&#62;/g ) {
+			$stud_data =~ s!&#60;&#60;letter_head&#62;&#62;!<p><img src="/images/letterhead2.png" alt="" href="/images/letterhead2.png" style="padding: 0px 0px 0px 0px; margin: 0px 0px 0px 0px">!g;
+		}
+
+		#student details
+		my $stud_details = 
+qq!
+<TABLE style="align: left">
+<TR><TH>Adm No.:<TD>$adm
+<TR><TH>Name:<TD>${$adms{$adm}}{"name"}
+<TR><TH>Class:<TD>${$adms{$adm}}{"class"}
+<TR><TH>Dorm/House:<TD>${$adms{$adm}}{"dorm"}
+</TABLE>
+!;
+
+		$stud_data =~ s/&#60;&#60;student_details&#62;&#62;/$stud_details/g;
+
+		my $fee_statement = 
+qq!
+<TABLE border="1">
+<THEAD><TH>Date<TH>Description<TH>Receipt No.<TH>Credits<TH>Debits<TH>Fee Balance</THEAD>
+<TBODY>
+!;
+
+		for my $cntr ( sort { $events{$adm}->{$a}->{"time"} <=> $events{$adm}->{$b}->{"time"} } keys %{$events{$adm}} ) {
+
+			my @time_then = localtime($events{$adm}->{$cntr}->{"time"});	
+			my $formatted_time = sprintf "%02d/%02d/%d %02d:%02d", $time_then[3],$time_then[4]+1,$time_then[5]+1900,$time_then[2],$time_then[1];
+
+			my $votehead = $events{$adm}->{$cntr}->{"votehead"};
+			#format
+			if ( exists $voteheads{$votehead} ) {
+				$votehead = $voteheads{$votehead};
+			}
+			else {
+
+				my @votehead_bts = split/\s+/, $votehead;
+
+				for ( my $i = 0; $i < @votehead_bts; $i++ ) {
+					$votehead_bts[$i] = ucfirst($votehead_bts[$i]);
+				}
+				$votehead = join(" ", @votehead_bts);
+			}
+
+			my $description = $votehead;
+
+			my $receipt = "";
+			#add receipt no.
+			if ( exists $events{$adm}->{$cntr}->{"receipt_no"} ) {
+				$receipt .= $events{$adm}->{$cntr}->{"receipt_no"};
+			}
+
+			my $credit = "";
+			my $debit = "";
+
+			#a figure less that 0 is a credit 
+			#introduced this to take care of fee updates
+			#some fee updates will be -ve(debits) others will be
+			#+ve (credits)
+			if ( $events{$adm}->{$cntr}->{"amount"} < 0 ) {
+				$credit = format_currency(-1 * $events{$adm}->{$cntr}->{"amount"});
+			}
+			else {
+				$debit = format_currency($events{$adm}->{$cntr}->{"amount"});
+			}
+
+			my $balance = "";
+
+			#only show the balance field if this entry
+			#has altered the balance (i.e it is a fee statement)
+			if ( exists $events{$adm}->{$cntr}->{"balance"} ) {
+				$balance = format_currency($events{$adm}->{$cntr}->{"balance"});
+			}
+
+			my $grey = "";	
+			if (exists $events{$adm}->{$cntr}->{"deleted"} ) {
+				$grey = qq! style="font-style: italic"!;
+			}
+
+			$fee_statement .= qq!<TR$grey><TD style="align: left">$formatted_time<TD style="align: left">$description<TD style="align: left">$receipt<TD style="align: right">$credit<TD style="align: right">$debit<TD style="align: right">$balance!;
+
+		}
+	
+		$fee_statement .= "</TBODY></TABLE>";
+
+		$stud_data =~ s/&#60;&#60;fee_statement&#62;&#62;/$fee_statement/g;
+
+		$results .= qq!<p>$stud_data<br class="new_page">!;;
+	}
+
+	$content = 
+qq*
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<title>Spanj::Accounts Management Information System::Fee Statement</title>
+
+<STYLE type="text/css">
+
+\@media print {
+	body {
+		margin-top: 0px;
+		margin-bottom: 0px;
+		padding: 0px;
+		font-size: 12pt;
+		font-family: "Times New Roman", serif;	
+	}
+
+	div.no_header {
+		display: none;
+	}
+
+	br.new_page {
+		page-break-after: always;
+	}
+
+}
+
+\@media screen {
+	div.noheader {}	
+	br.new_page {}
+}
+
+</STYLE>
+</head>
+<body>
+<div class="no_header">
+$header
+</div>
+$results
+</body>
+</html>
+*;
+
+	#log view
+	my @today = localtime;	
+	my $day_month_yr = sprintf "%d-%02d-%02d", $today[5] + 1900, $today[4] + 1, $today[3];
+
+	open (my $log_f, ">>$log_d/user_actions-$day_month_yr.log");
+       	if ($log_f) {
+
+		my $time = sprintf "%d-%02d-%02d-%02d%02d.%02d", $today[5]+1900,$today[4]+1,$today[3],$today[2],$today[1],$today[0];
+		flock ($log_f, LOCK_EX) or print STDERR "Could not log view fee statements for $id due to flock error: $!$/";
+		seek ($log_f, 0, SEEK_END);	
+ 
+		print $log_f "$id VIEW FEE STATEMENTS $time\n";
+		flock ($log_f, LOCK_UN);
+          	close $log_f;
+       	}
+	else {
+		print STDERR "Could not log view fee statements $id: $!\n";
+	}
+
+	$con2->disconnect();
+
+}
+}
+
+if (not $post_mode) {
+
+	my %grouped_classes = ("1"=> "1", "2"=> "2", "3"=> "3","4"=> "4");
+	
+	my $prep_stmt = $con->prepare("SELECT value FROM vars WHERE id='1-classes' LIMIT 1");
+
+	if ($prep_stmt) {
+		my $rc = $prep_stmt->execute();
+		if ($rc) {
+			while (my @rslts = $prep_stmt->fetchrow_array()) {
+				my @classes = split/,/, $rslts[0];
+				%grouped_classes = ();
+				for my $class (@classes) {
+					if ($class =~ /(\d+)/) {	
+						$grouped_classes{$1}->{$class}++;
+					}
+				}
+			}
+		}
+	}
+
+	my $classes_select = qq!<TABLE cellpadding="5%" cellspacing="5%"><TR>!;
+	for my $class_yr (sort {$a <=> $b} keys %grouped_classes) {
+		my @classes = keys %{$grouped_classes{$class_yr}};
+		
+		$classes_select .= "<TD>";
+		for my $class (sort {$a cmp $b} @classes) {
+			$classes_select .= qq{<INPUT type="checkbox" name="class_$class" value="$class"><LABEL for="class_$class">$class</LABEL><BR>};
+		}
+	}
+
+	my $current_yr = (localtime)[5] + 1900; 
+	$classes_select .= qq!<TD style="vertical-align: center; border-left: solid"><LABEL for="year">Year</LABEL>&nbsp;<INPUT type="text" size="4" maxlength="4" name="year" value="$current_yr"></TABLE>!;
+
+	my $conf_code = gen_token();
+	$session{"confirm_code"} = $conf_code;
+
+	$content = 
+qq*
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<title>Spanj::Accounts Management Information System::Fee Statements</title>
+
+<script type="text/javascript">
+
+var balance_expr_re = /^[><]?\\s\*[0-9]\*\$/;
+var adm_no_re = /^([0-9]\*(\\-[0-9]\*)?\\s\*)\*\$/;
+
+function check_adm_nos() {
+
+	var adm_numbers = document.getElementById("adm_nos").value;
+	if (adm_numbers.match(adm_no_re)) {
+		document.getElementById("adm_nos_err").innerHTML = "";
+	}
+	else {
+		document.getElementById("adm_nos_err").innerHTML = "\*";
+	}
+}
+
+
+</script>
+</head>
+<body>
+$header
+$feedback
+<form method="POST" action="/cgi-bin/fee_statements.cgi">
+<input type="hidden" name="confirm_code" value="$conf_code">
+<p><h3>Filter Students By</h3>
+
+<ul style="list-style-type: none">
+<li><h4>Adm No.</h4>
+<span id="adm_nos_err" style="color: red"></span><label for="adm_no">Adm no(s)</label>&nbsp;<input type="text" size="50" name="adm_nos" id="adm_nos" onkeyup="check_adm_nos()">&nbsp;&nbsp;<em>You can include ranges like 4490-4500</em>
+<li><h4>Class</h4>
+$classes_select
+</ul>
+
+<p><h3>Message Format</h3>
+<p>
+
+<div style="width: 50em">
+<textarea name="message_format" cols="100" rows="20">
+&lt;&lt;letter_head&gt;&gt;
+&lt;&lt;student_details&gt;&gt;
+&lt;&lt;fee_statement&gt;&gt;
+</textarea>
+
+<p>use <em>&lt;&lt;letter_head&gt;&gt;</em>, <em>&lt;&lt;student_details&gt;&gt;</em> and <em>&lt;&lt;fee_statement&gt;&gt;</em> to refer to the <a href="/images/letterhead2.png">school's letterhead</a>, student's details (e.g name,adm no.,class) and detailed fee statement, respectively.
+</div>
+
+<table>
+<tr>
+<td><input type="submit" name="view_print" value="View/Print">
+</table>
+</form>
+
+</body>
+
+</html>
+*;
+
+
+}
+
+
+print "Status: 200 OK\r\n";
+print "Content-Type: text/html; charset=UTF-8\r\n";
+
+my $len = length($content);
+print "Content-Length: $len\r\n";
+
+my @new_sess_array = ();
+
+for my $sess_key (keys %session) {
+	push @new_sess_array, $sess_key."=".$session{$sess_key};        
+}
+my $new_sess = join ('&',@new_sess_array);
+
+print "X-Update-Session: $new_sess\r\n";
+
+print "\r\n";
+print $content;
+$con->disconnect() if (defined $con and $con);
+
+sub gen_token {
+	my @key_space = ("A","B","C","D","E","F","0","1","2","3","4","5","6","7","8","9");
+	my $len = 5 + int(rand 15);
+	if (@_ and ($_[0] eq "1")) {
+		@key_space = ("A","B","C","D","E","F","G","H","J","K","L","M","N","P","T","W","X","Z","7","0","1","2","3","4","5","6","7","8","9");
+		$len = 10 + int (rand 5);
+	}
+	my $token = "";
+	for (my $i = 0; $i < $len; $i++) {
+		$token .= $key_space[int(rand @key_space)];
+	}
+	return $token;
+}
+
+sub htmlspecialchars {
+	my $cp = $_[0];
+	$cp =~ s/&/&#38;/g;
+        $cp =~ s/</&#60;/g;
+        $cp =~ s/>/&#62;/g;
+        $cp =~ s/'/&#39;/g;
+        $cp =~ s/"/&#34;/g;
+        return $cp;
+}
+
+sub remove_padding {
+
+	return undef unless (@_);
+
+	my $packed = $_[0];
+	my @bytes = unpack("C*", $packed);
+	
+	my $final_index = $#bytes;
+	my $pad_size = $bytes[$final_index];
+
+	my $msg_valid = 1;
+	#verify msg
+	
+	for ( my $i = 1; $i < $pad_size; $i++ ) {
+		unless ( $bytes[$final_index - $i] == $pad_size ) {
+			$msg_valid = 0;
+			last;
+		}
+	}
+
+	if ($msg_valid) {
+		my $msg_size = ($final_index + 1) - $pad_size;
+		my $msg = unpack("A${msg_size}", $packed);
+
+		return $msg;
+	}
+	return undef;
+}
+
+sub add_padding {
+
+	return undef unless (@_);
+
+	my $tst_str = $_[0];
+	my $tst_str_len = length($tst_str);
+
+	my $rem = 16 - ($tst_str_len % 16);
+	if ($rem == 0 ) {
+		$rem = 16;
+	}
+
+	my @extras = ();
+	for (my $i = 0; $i < $rem; $i++) {
+		push @extras, $rem;
+	}
+
+	my $padded = pack("A${tst_str_len}C${rem}", $tst_str, @extras);
+	return $padded;
+}
+
+sub format_currency {
+
+	return "" unless (@_);
+
+	my $formatted_num = $_[0];
+
+	if ( $_[0] =~ /^(\-?)(\d+)(\.(?:\d))?$/ ) {
+
+		my $sign = $1;
+		my $shs = $2;
+		my $cents = $3;
+
+		$sign = "" if (not defined $sign);
+		$cents = "" if (not defined $cents);
+
+		my $num_blocks = int(length($shs) / 3);
+
+		if ($num_blocks > 0) {
+
+			my @nums = ();
+
+			my $surplus = length($shs) % 3;
+			if ($surplus > 0) {
+				push @nums, substr($shs, 0, $surplus);
+			}
+
+			for (my $i = 0; $i < $num_blocks; $i++) {
+				push @nums, substr($shs, $surplus + ($i * 3),3);
+			}
+
+			$formatted_num = join(",", @nums); 
+			$formatted_num = $sign . $formatted_num;
+			$formatted_num .= $cents;
+		}
+
+
+	}
+	return $formatted_num;
+
+}
